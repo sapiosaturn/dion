@@ -1,13 +1,14 @@
 import math
+from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 from collections import defaultdict
 from itertools import chain
 from torch import Tensor
 from torch.distributed import ProcessGroup
-from torch.distributed.tensor import DeviceMesh, DTensor
+from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
-from typing import Callable, Generator, List, Optional, Union
+from typing import Callable, Generator, List, Optional
 
 from .newton_schulz_triton import (
     TRITON_AVAILABLE,
@@ -19,11 +20,41 @@ from .opt_utils import AsyncRuntime, AsyncTask, to_local
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
 
-class DistributedOrthoBase(Optimizer):
+@dataclass(frozen=True)
+class ShardInfo:
+    """Per-parameter sharding metadata derived from a DTensor's placements.
+
+    Matrix-dim shards require all-to-all on ``process_group`` to rebuild the
+    full matrix; batch-dim shards are local (each rank's slice is complete).
     """
-    Shared base class for distributed orthogonalization optimizers (NorMuon, Dion2).
-    Handles distributed setup, Newton-Schulz config, step orchestration,
-    shard detection, and scalar optimizer tasks (Lion, AdamW).
+
+    is_batch_sharded: bool
+    is_matrix_sharded: bool
+    sharded_tensor_dim: Optional[int]
+    process_group: Optional[ProcessGroup]
+    device_rank: int
+    world_size: int
+
+
+_LOCAL_SHARD_INFO = ShardInfo(
+    is_batch_sharded=False,
+    is_matrix_sharded=False,
+    sharded_tensor_dim=None,
+    process_group=None,
+    device_rank=0,
+    world_size=1,
+)
+
+
+class DistributedOrthoBase(Optimizer):
+    """Shared base class for distributed orthogonalization optimizers (Muon,
+    NorMuon, Dion2).
+
+    Distributed topology is read **per parameter** from each DTensor's own
+    ``device_mesh`` and ``placements``; no global ``distributed_mesh`` is
+    required. One instance can own parameters on different meshes (e.g.
+    MoE experts on an EP-region FSDP mesh and non-experts on the global
+    FSDP mesh). Plain ``torch.Tensor`` params are treated as single-GPU.
 
     Subclasses must implement ``_create_ortho_tasks()``.
     """
@@ -31,7 +62,6 @@ class DistributedOrthoBase(Optimizer):
     def __init__(
         self,
         params: ParamsT,
-        distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]],
         algo_name: str,
         defaults: dict,
         use_gram_newton_schulz: bool = False,
@@ -42,30 +72,19 @@ class DistributedOrthoBase(Optimizer):
         super().__init__(params, defaults)
         self._algo_name = algo_name
 
-        # Distributed configuration
-        if isinstance(distributed_mesh, DeviceMesh):
-            if distributed_mesh.ndim != 1:
-                raise ValueError(
-                    f"Only 1D DeviceMesh supported, but got {distributed_mesh.ndim}D. "
-                    f"For HSDP, provide the 1D sharded sub-mesh."
-                )
-            self._device_rank = distributed_mesh.get_local_rank()
-            self._world_size = distributed_mesh.size()
-            self._process_group = distributed_mesh.get_group()
-        elif isinstance(distributed_mesh, ProcessGroup):
-            self._device_rank = dist.get_rank(distributed_mesh)
-            self._world_size = dist.get_world_size(distributed_mesh)
-            self._process_group = distributed_mesh
-        elif distributed_mesh is None:
-            self._device_rank = 0
-            self._world_size = 1
-            self._process_group = None
-        else:
-            raise TypeError(
-                f"Invalid distributed_mesh type: {type(distributed_mesh)}. "
-                f"Expected DeviceMesh or ProcessGroup."
+        # Each distinct param shape triggers a Newton-Schulz recompile, so
+        # many-layer (MoE) models blow past the default dynamo cache. Raise
+        # the floor; user overrides set before this ctor are preserved.
+        _DION_COMPILE_CACHE_FLOOR = 128
+        if torch._dynamo.config.cache_size_limit < _DION_COMPILE_CACHE_FLOOR:
+            torch._dynamo.config.cache_size_limit = _DION_COMPILE_CACHE_FLOOR
+        if (
+            torch._dynamo.config.accumulated_cache_size_limit
+            < _DION_COMPILE_CACHE_FLOOR * 4
+        ):
+            torch._dynamo.config.accumulated_cache_size_limit = (
+                _DION_COMPILE_CACHE_FLOOR * 4
             )
-        self._distributed_mesh = distributed_mesh
 
         # Orthogonalization function configuration
         if newton_schulz_func is not None:
@@ -149,19 +168,14 @@ class DistributedOrthoBase(Optimizer):
                 state["variance"] = torch.zeros_like(param)
         return state
 
-    def _get_shard_info(self, param: Tensor, group: dict):
-        """Determine sharding info. Returns (is_batch_sharded, is_matrix_sharded, sharded_tensor_dim)."""
-        is_batch_sharded = False
-        is_matrix_sharded = False
-        sharded_tensor_dim = None
+    def _get_shard_info(self, param: Tensor, group: dict) -> ShardInfo:
+        """Derive sharding metadata from ``param``'s DTensor placements.
 
+        Batch-dim shards are local (no comm); a matrix-dim shard triggers
+        all-to-all on its mesh-dim's process group.
+        """
         if not isinstance(param, DTensor):
-            return is_batch_sharded, is_matrix_sharded, sharded_tensor_dim
-
-        if not isinstance(self._distributed_mesh, DeviceMesh):
-            raise RuntimeError(
-                "Must create optimizer with DeviceMesh if using DTensor parameters."
-            )
+            return _LOCAL_SHARD_INFO
 
         shard_placements = [
             (i, p)
@@ -169,6 +183,7 @@ class DistributedOrthoBase(Optimizer):
             if p.is_shard() and param.device_mesh.size(i) > 1
         ]
 
+        is_batch_sharded = False
         if not group["flatten"]:
             matrix_dims = {param.ndim - 1, param.ndim - 2}
             is_batch_sharded = any(
@@ -178,27 +193,32 @@ class DistributedOrthoBase(Optimizer):
                 (i, p) for i, p in shard_placements if p.dim in matrix_dims
             ]
 
-        if len(shard_placements) == 1:
-            is_matrix_sharded = True
-            sharded_mesh_dim = shard_placements[0][0]
-            sharded_tensor_dim = shard_placements[0][1].dim
-
-            if (
-                param.device_mesh.get_group(sharded_mesh_dim)
-                != self._process_group
-            ):
-                raise RuntimeError(
-                    f"Got DTensor sharded over mesh dimension {sharded_mesh_dim} "
-                    f"different from the optimizer's device mesh. "
-                    f"DTensor has mesh: {param.device_mesh}, placements: {param.placements}, "
-                    f"but optimizer was created with mesh: {self._distributed_mesh}."
-                )
-        elif len(shard_placements) > 1:
+        if len(shard_placements) == 0:
+            return ShardInfo(
+                is_batch_sharded=is_batch_sharded,
+                is_matrix_sharded=False,
+                sharded_tensor_dim=None,
+                process_group=None,
+                device_rank=0,
+                world_size=1,
+            )
+        if len(shard_placements) > 1:
             raise NotImplementedError(
-                f"{self.__class__.__name__} does not support parameters with multiple sharded dimensions."
+                f"{self.__class__.__name__} does not support parameters with "
+                f"multiple matrix-sharded dimensions. Got placements "
+                f"{param.placements} on mesh {param.device_mesh}."
             )
 
-        return is_batch_sharded, is_matrix_sharded, sharded_tensor_dim
+        sharded_mesh_dim, shard_placement = shard_placements[0]
+        mesh = param.device_mesh
+        return ShardInfo(
+            is_batch_sharded=is_batch_sharded,
+            is_matrix_sharded=True,
+            sharded_tensor_dim=shard_placement.dim,
+            process_group=mesh.get_group(sharded_mesh_dim),
+            device_rank=mesh.get_local_rank(sharded_mesh_dim),
+            world_size=mesh.size(sharded_mesh_dim),
+        )
 
     def _create_ortho_tasks(
         self, param_groups: List[dict]

@@ -2,9 +2,9 @@ import torch
 from collections import defaultdict
 from torch import Tensor
 from torch.distributed import ProcessGroup
-from torch.distributed.tensor import DeviceMesh, DTensor
+from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import ParamsT
-from typing import Callable, Generator, List, Optional, Tuple, Union
+from typing import Callable, Generator, List, Optional, Tuple
 
 from .megabatch_base import (
     DistributedOrthoBase,
@@ -18,12 +18,14 @@ from .opt_utils import AsyncTask, to_local
 
 class Muon(DistributedOrthoBase):
     """
-    Distributed Muon optimizer for PyTorch FSDP2. Also compatible with DDP.
+    Distributed Muon optimizer for PyTorch FSDP2.
+
+    Distributed topology is read per-parameter from each DTensor's own
+    ``device_mesh`` and ``placements``; see :class:`DistributedOrthoBase`
+    for details.
 
     Args:
         params: Parameters for the optimizer.
-        distributed_mesh: DeviceMesh or ProcessGroup for distributed training.
-            Use DeviceMesh for FSDP2 and ProcessGroup for DistributedDataParallel.
         lr: Base learning rate. For Muon, this will be scaled based on the matrix dimensions.
             For element-wise update rules, this is the actual learning rate and no additional scaling is done.
         mu: Momentum factor for Muon algorithm.
@@ -51,7 +53,6 @@ class Muon(DistributedOrthoBase):
     def __init__(
         self,
         params: ParamsT,
-        distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]] = None,
         lr: float = 0.01,
         mu: float = 0.95,
         betas: Tuple[float, float] = (0.9, 0.95),
@@ -92,7 +93,7 @@ class Muon(DistributedOrthoBase):
             adjust_lr=adjust_lr,
         )
         super().__init__(
-            params, distributed_mesh, "muon", defaults,
+            params, "muon", defaults,
             use_gram_newton_schulz=use_gram_newton_schulz,
             use_triton=use_triton,
             use_polar_express=use_polar_express,
@@ -116,7 +117,7 @@ class Muon(DistributedOrthoBase):
             if not group_params:
                 continue
 
-            update_args = dict(
+            common_args = dict(
                 lr=torch.tensor(group["lr"]),
                 momentum=torch.tensor(group["mu"]),
                 weight_decay=torch.tensor(group["weight_decay"]),
@@ -124,38 +125,39 @@ class Muon(DistributedOrthoBase):
                 nesterov=group["nesterov"],
                 flatten=group["flatten"],
                 adjust_lr=group["adjust_lr"],
-                device_rank=self._device_rank,
-                world_size=self._world_size,
-                process_group=self._process_group,
                 newton_schulz_func=self._newton_schulz_func,
                 cautious_wd=group["cautious_wd"],
             )
 
+            # Bucket for mega-batching: params must share local shape AND
+            # distributed topology. device_mesh is part of the key so that
+            # e.g. experts on edp_mesh and non-experts on dp_mesh don't
+            # share a communication round.
             shape_groups: dict[tuple, list] = defaultdict(list)
             for p in group_params:
-                sharding = p.placements if isinstance(p, DTensor) else None
-                shape_groups[(p.shape, sharding, p.dtype)].append(p)
+                if isinstance(p, DTensor):
+                    key = (p.shape, p.placements, p.device_mesh, p.dtype)
+                else:
+                    key = (p.shape, None, None, p.dtype)
+                shape_groups[key].append(p)
 
-            for (_shape, _sharding, _dtype), params in shape_groups.items():
+            for params in shape_groups.values():
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, "muon") for p in params]
                 momentums = [s["momentum"] for s in states]
 
-                is_batch_sharded, is_matrix_sharded, sharded_tensor_dim = (
-                    self._get_shard_info(params[0], group)
-                )
-
-                megabatch_args = update_args
-                if is_batch_sharded and not is_matrix_sharded:
-                    megabatch_args = {**update_args, "process_group": None}
+                shard_info = self._get_shard_info(params[0], group)
 
                 yield AsyncTask(
                     muon_update_megabatch_async(
                         X=params,
                         G=gradients,
                         M=momentums,
-                        shard_dim=sharded_tensor_dim,
-                        **megabatch_args,
+                        shard_dim=shard_info.sharded_tensor_dim,
+                        device_rank=shard_info.device_rank,
+                        world_size=shard_info.world_size,
+                        process_group=shard_info.process_group,
+                        **common_args,
                     )
                 )
 
