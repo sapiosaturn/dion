@@ -12,6 +12,7 @@ from .megabatch_base import (
     muon_update_newton_schulz,
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
+    adjust_lr_keller_muon,
 )
 from .opt_utils import AsyncTask, to_local
 
@@ -60,7 +61,7 @@ class Muon(DistributedOrthoBase):
         cautious_wd: bool = False,
         epsilon: float = 1e-8,
         nesterov: bool = False,
-        adjust_lr: Optional[str] = "spectral_norm",
+        adjust_lr: Optional[str] = "keller_muon",
         flatten: bool = False,
         use_gram_newton_schulz: bool = False,
         use_triton: bool = False,
@@ -73,9 +74,9 @@ class Muon(DistributedOrthoBase):
             raise ValueError(f"Invalid momentum factor (mu): {mu}")
         if len(betas) != 2 or betas[0] < 0.0 or betas[1] < 0.0:
             raise ValueError(f"Invalid betas: {betas}")
-        if adjust_lr not in ("spectral_norm", "rms_norm", None):
+        if adjust_lr not in ("spectral_norm", "rms_norm", "keller_muon", None):
             raise ValueError(
-                f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm', 'rms_norm', or None."
+                f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm', 'rms_norm', 'keller_muon', or None."
             )
 
         defaults = dict(
@@ -214,6 +215,8 @@ def muon_update_megabatch_async(
         adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
     elif adjust_lr == "rms_norm":
         adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
+    elif adjust_lr == "keller_muon":
+        adjusted_lr = adjust_lr_keller_muon(lr, X[0].shape, flatten=flatten)
     else:
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 

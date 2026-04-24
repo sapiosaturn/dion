@@ -440,3 +440,13 @@ def adjust_lr_spectral_norm(lr, param_shape, flatten):
     else:
         fan_out, fan_in = param_shape[-2:]
     return lr * math.sqrt(fan_out / fan_in)
+
+
+def adjust_lr_keller_muon(lr, param_shape, flatten):
+    """Keller Muon LR scaling used by the Trinity large MuonMS path."""
+    if flatten:
+        fan_out = param_shape[0]
+        fan_in = math.prod(param_shape[1:])
+    else:
+        fan_out, fan_in = param_shape[-2:]
+    return lr * max(1, fan_out / fan_in) ** 0.5
